@@ -432,7 +432,7 @@ pub fn minimax_with_timeout(
         return 0;
     }
 
-    moves.sort_by(|a, b| b.priority.cmp(&a.priority));
+    moves.sort_by_key(|m| std::cmp::Reverse(m.priority));
 
     let mut best_x = -1i32;
     let mut best_y = -1i32;
@@ -974,7 +974,7 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
     // root moves and searches it on its own GameState clone).
     let step_start = Instant::now();
     let mut sorted_moves = moves.clone();
-    sorted_moves.sort_by(|a, b| b.priority.cmp(&a.priority));
+    sorted_moves.sort_by_key(|m| std::cmp::Reverse(m.priority));
 
     let (best_x_out, best_y_out, moves_considered, final_best_score, won_early) =
         run_root_search(game, &sorted_moves, ai_player);
