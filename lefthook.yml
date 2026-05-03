@@ -1,0 +1,27 @@
+output:
+  - summary
+  - failure
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: rustfmt
+      run: cargo fmt --all -- --check
+      glob: "*.rs"
+
+    - name: clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      glob: "*.rs"
+
+    - name: cargo test
+      run: cargo test --all-features
+      glob: "*.{rs,toml}"
+
+    - name: check for conflict markers and whitespace issues
+      run: git --no-pager diff --check
+
+pre-push:
+  parallel: false
+  jobs:
+    - name: integration
+      run: just integration
