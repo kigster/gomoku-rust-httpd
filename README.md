@@ -1,6 +1,11 @@
 # gomoku-rust-httpd
 
-[![CI](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
+[![Format](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/fmt.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/fmt.yml)
+[![Clippy](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/clippy.yml)
+[![Test](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/test.yml)
+[![Doc](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/doc.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/doc.yml)
+[![Whitespace](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/whitespace.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/whitespace.yml)
+[![Build](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/build.yml)
 [![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 

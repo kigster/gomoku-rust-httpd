@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    name: cargo build --release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release
+      - name: Smoke test --version
+        run: ./target/release/gomoku-rust-httpd --version
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gomoku-rust-httpd-linux-x86_64
+          path: target/release/gomoku-rust-httpd
+          if-no-files-found: error
+          retention-days: 14

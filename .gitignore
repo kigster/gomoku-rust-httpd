@@ -2,3 +2,4 @@
 /target
 /bin/gomoku-rust-httpd
 PR.md
+/bin/*

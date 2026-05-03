@@ -20,12 +20,42 @@ cd "$ROOT"
 
 PORT="${PORT:-19931}"
 DAEMON_BIN="${DAEMON_BIN:-$ROOT/target/release/gomoku-rust-httpd}"
-CLIENT_BIN="${CLIENT_BIN:-$ROOT/bin/gomoku-http-client}"
 LOG_DIR="${LOG_DIR:-$ROOT/target/integration-logs}"
 DEPTH="${DEPTH:-2}"
 RADIUS="${RADIUS:-2}"
 BOARD="${BOARD:-15}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-90}"
+
+# Resolve the client binary in priority order:
+#   1. CLIENT_BIN env override.
+#   2. ./bin/gomoku-http-client in this repo (if a contributor copied it here).
+#   3. ../gomoku-multi-mode-monorepo/bin/gomoku-http-client (the canonical build).
+# If none exist, skip the test cleanly with a warning rather than failing CI on
+# a machine that doesn't have the C monorepo cloned next to this repo.
+discover_client_bin() {
+    if [[ -n "${CLIENT_BIN:-}" ]]; then
+        echo "$CLIENT_BIN"
+        return 0
+    fi
+    local candidates=(
+        "$ROOT/bin/gomoku-http-client"
+        "$ROOT/../gomoku-multi-mode-monorepo/bin/gomoku-http-client"
+    )
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! CLIENT_BIN="$(discover_client_bin)"; then
+    echo "WARN: gomoku-http-client not found locally or in the C monorepo;" >&2
+    echo "      skipping the two-client integration test." >&2
+    echo "      Set CLIENT_BIN=/path/to/gomoku-http-client to force-run." >&2
+    exit 0
+fi
 
 mkdir -p "$LOG_DIR"
 
@@ -35,10 +65,7 @@ if [[ ! -x "$DAEMON_BIN" ]]; then
     exit 1
 fi
 
-if [[ ! -x "$CLIENT_BIN" ]]; then
-    echo "ERROR: client binary not found at $CLIENT_BIN" >&2
-    exit 1
-fi
+echo "==> using client binary: $CLIENT_BIN"
 
 cleanup() {
     local code=$?
