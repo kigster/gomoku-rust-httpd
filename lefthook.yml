@@ -2,6 +2,9 @@ output:
   - summary
   - failure
 
+# Quick local gates that mirror the GitHub Actions CI workflow
+# (.github/workflows/ci.yml). Keep these in sync — every step that fails
+# in CI should already have failed here.
 pre-commit:
   parallel: true
   jobs:
@@ -17,7 +20,13 @@ pre-commit:
       run: cargo test --all-features
       glob: "*.{rs,toml}"
 
-    - name: check for conflict markers and whitespace issues
+    - name: cargo doc
+      run: cargo doc --no-deps --document-private-items --quiet
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      glob: "*.{rs,toml}"
+
+    - name: conflict markers and whitespace
       run: git --no-pager diff --check
 
 pre-push:

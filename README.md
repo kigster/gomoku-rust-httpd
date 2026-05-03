@@ -1,14 +1,25 @@
 # gomoku-rust-httpd
 
+[![CI](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
+
 A Rust port of the C `gomoku-httpd` daemon. The two binaries are wire-level
 compatible: requests and responses use exactly the same JSON shape, the same
-compact board notation (`K9` etc.), and the same CLI flags. This Rust build
-adds:
+compact board notation (`K9` etc.), and the same CLI flags. Compared to the
+C reference this build adds:
 
 - Concurrent request handling capped at the detected CPU core count.
+- **Root-level parallelism inside a single search.** When a single AI
+  request has the box mostly to itself, the iterative-deepening root
+  fans out across all available cores via rayon — measured ~10x speed-up
+  versus the C reference on the same depth-6 input (72.4s → 6.8s on a
+  16-core machine, identical evaluation count).
 - Coloured CLI help and one-line per-record colour logging.
-- A semaphore-driven `/ready` and HAProxy agent-check that flips to `busy`
-  only when every worker is actually busy.
+- A semaphore-driven `/ready` and HAProxy agent-check that flips to
+  `busy` only when every worker is actually busy.
+- Request-latency reporting: every `play:` INFO log line ends with
+  `request latency [N.NNN seconds]` at 3-decimal precision.
 
 > **Two halves below.** Part I is for **operators** running the daemon.
 > Part II is for **developers** extending the AI.
@@ -138,11 +149,14 @@ escaped to `\n`. With colour enabled the timestamp is dimmed and the level
 is colourised; with `-C` or `NO_COLOR` set the output is plain ASCII.
 
 ```
-[2026-05-02 22:35:45.241] INFO  play: player=O move=[8,8] type=adjacent depth=2 radius=2 evals=1 time=0.000s queue=0.42ms pipeline=
+[2026-05-03 08:35:45.241] INFO  play: player=O move=[8,8] type=minimax depth=6 radius=3 evals=468 time=0.355s queue=0.13ms pipeline=have_win(0.00ms) -> block_threat(0.00ms) -> have_vct(0.01ms) -> block_vct(0.00ms) -> minimax(355.07ms) request latency [0.355 seconds]
 ```
 
 Per-request: `INFO` produces 1–2 lines (one per move; an extra line on
 game-over). `DEBUG` adds the parsed-game and decision-pipeline detail.
+The trailing `request latency [N.NNN seconds]` is wall time from
+request arrival to response generation, including the queue wait at
+the per-CPU semaphore.
 
 ### Troubleshooting
 
@@ -176,39 +190,70 @@ src/
 
 `ai::find_best_ai_move` consults heuristics in order; the first one that
 returns a move wins. Each step records a `ScoringEntry` so `--report-scoring`
-can surface the decision path.
+can surface the decision path. Threat values come from
+`eval::evaluate_threat_fast`, which mirrors the C reference exactly
+(including the overline distinction — six or more contiguous stones is
+not a win in standard gomoku).
 
-1. **`have_win`** — does any candidate immediately make five-in-a-row?
-2. **`block_threat`** — must we block an opponent threat scoring ≥ 40 000?
-3. **`have_vct`** — Victory by Continuous Threats: forced-win sequence
+1. **`have_win`** — does any candidate immediately make five-in-a-row
+   (threat ≥ 1 000 000)?
+2. **`block_threat`** — must we block an opponent move that wins
+   immediately or creates an open four (threat ≥ 500 000)? Closed fours
+   are intentionally NOT force-blocked here — minimax weighs them against
+   offensive replies.
+3. **`open_four`** — play our own open four (threat ≥ 500 000), now safe
+   that opponent immediate threats have been checked. Wins in two turns
+   barring a counter-five.
+4. **`have_vct`** — Victory by Continuous Threats: forced-win sequence
    exists for us within 10 plies of forcing moves.
-4. **`block_vct`** — block the opponent's VCT by finding a move that
+5. **`block_vct`** — block the opponent's VCT by finding a move that
    removes their forced sequence.
-5. **`compound_three`** — play a move that creates a double-three /
-   compound 3+ pattern.
-6. **`block_open_three`** — block the opponent's open three when we don't
-   already have initiative.
-7. **`forcing_four`** — push a four-in-a-row when the opponent must respond.
-8. **`minimax`** — fall back to iterative deepening minimax with
-   alpha-beta pruning, a 200K-entry transposition table per AI side,
-   killer-move ordering, and a heuristic evaluator that combines the
-   threat matrix from Allis (1994) with the open-three / open-two
-   weighting from the Stanford 2000 poster.
+6. **`minimax`** — fall back to iterative-deepening minimax with
+   alpha-beta pruning, a transposition table per AI side, killer-move
+   ordering, and a heuristic evaluator that combines the threat matrix
+   from Allis (1994) with the open-three / open-two weighting from the
+   Stanford 2000 poster.
+
+Compound-three / open-three / forcing-four heuristics that used to live
+between `block_vct` and `minimax` have been removed because minimax with
+threat-aware move ordering handles those positions better with multi-ply
+lookahead — and the prologue versions sometimes overrode minimax's
+correct answer.
 
 The threat constants (`THREAT_FIVE`, `THREAT_STRAIGHT_FOUR`, etc.) and
-their numeric weights are defined in `eval.rs::populate_threat_matrix`.
-The combination scoring (e.g. `THREE_AND_FOUR`) is in
+their numeric weights are defined as the compile-time `THREAT_COST`
+table in `eval.rs`. Combination scoring (e.g. `THREE_AND_FOUR`) is in
 `eval.rs::calc_combination_threat`.
+
+#### Root-level parallelism
+
+`ai::run_root_search` drives iterative deepening. When
+`available_parallelism() ≥ 2`, the search is non-trivial
+(`max_depth ≥ 3`, more than one root move) and the current depth is
+≥ 2, the sorted root moves are split into `cores`-sized chunks and
+searched in parallel via rayon. Each worker takes a `GameState` clone
+so its transposition table, killer-move table, board mutations and
+zobrist hash are thread-local. A shared `AtomicBool` lets workers
+cooperate on timeout and on early termination when one of them finds
+a near-win.
+
+The HTTP-layer semaphore (`-j N`, default = detected cores) bounds the
+number of concurrent searches. Inside each search, rayon's global pool
+work-steals across whichever cores are idle. Two concurrent searches
+on a 12-core box do **not** strictly partition into 6+6 — they share
+the same thread pool, each making progress on whichever cores happen
+to be free. To enforce stricter isolation, lower `-j`.
 
 ### Adding a new heuristic
 
 1. Add the threat-pattern recogniser in `eval.rs`, ideally in
    `evaluate_threat_fast` so `generate_moves` ranks candidates correctly.
 2. Insert the new step into `ai::find_best_ai_move` between `block_vct`
-   and `minimax`. Push a `ScoringEntry` with `evaluated_moves`, `score`,
-   `time_ms`, and `decisive=true` if the step short-circuits.
-3. Add a test in `src/ai.rs::tests` that builds a board the new heuristic
-   should fire on and asserts the returned `move_type`.
+   and the `run_root_search` call. Push a `ScoringEntry` with
+   `evaluated_moves`, `score`, `time_ms`, and `decisive=true` if the
+   step short-circuits.
+3. Add a test in `src/ai.rs::tests` that builds a board the new
+   heuristic should fire on and asserts the returned `move_type`.
 4. Re-run `cargo test` and the integration script.
 
 ### Tests
