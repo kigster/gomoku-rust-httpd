@@ -1,9 +1,6 @@
 # gomoku-rust-httpd
 
-[![CI](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
-[![Format check](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg?event=push&job=fmt)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
-[![Clippy](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg?event=push&job=clippy)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
-[![Tests](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg?event=push&job=test)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
+[![CI](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kigster/gomoku-rust-httpd/actions/workflows/ci.yml)
 [![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 
