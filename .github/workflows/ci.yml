@@ -35,6 +35,28 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  doc:
+    name: Doc build
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --no-deps --document-private-items --quiet
+
+  whitespace:
+    name: Whitespace and conflict markers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: git diff --check
+        run: git --no-pager diff --check HEAD~1..HEAD -- || git --no-pager diff --check
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
@@ -54,7 +76,7 @@ jobs:
   build:
     name: Release build artifact
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, doc, whitespace, test]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
