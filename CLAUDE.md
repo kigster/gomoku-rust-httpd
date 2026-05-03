@@ -1,43 +1,97 @@
-d This is a Rust Version of the Gomoku HTTPD Daemon 
+# gomoku-rust-httpd — Claude project notes
 
-There is a directory one level above: gomoku-multi-mode-monorepo/ that contains gomoku-c directory. This directory produces ./gomoku binary for terminal TUI play, and gomoku-httpd — a daemion that binds to a port and listens on incoming requests. The libraries for JSON and HTTPD handling are in gomoku-c/vendor
+This is the Rust port of the C `gomoku-httpd` daemon. The binaries are
+wire-compatible: same JSON shape, same compact board notation, same CLI
+flags. The C source lives at
+`../gomoku-multi-mode-monorepo/gomoku-c/` and is the algorithmic
+reference whenever Rust behavior is unclear.
 
-## Explicit Perissions
+## Repository expectations
 
-You are to ensure this Rust project:
+When working in this repo, please uphold the following:
 
-1. follows latest Rust conventions ande versions
-2. automaically upgrades everything when we are behind
-3. can use event httpd library already written
-4. Can use JSON parsing library and accepts and generates identical JSON to the gomoku-c
-5. Has colorful line logging library and prints INFO logs 2-3 lines per request, 5-9 in debug level
-6. can handle more than one request at a time, by creating partitioned set of games and boards, and all 
-   computations as they are completely independent of each other.
+1. Follow current Rust conventions and use `edition = "2024"`. Prefer the
+   newest stable APIs.
+2. Keep dependencies up to date when there is no breaking-change risk.
+3. Reuse the existing HTTPD library choice (actix-web). Do not swap web
+   frameworks without a strong reason.
+4. JSON parsing/serialization must produce output byte-equivalent to
+   `gomoku-c`'s — this is checked by the integration script.
+5. Logging: `INFO` produces 1–2 lines per request (one for the move,
+   one extra on game over). `DEBUG` adds 5–9 lines (parsed game state,
+   decision pipeline, etc.). Each `play:` INFO line ends with
+   `request latency [N.NNN seconds]` (3 decimals).
+6. Multiple concurrent `/gomoku/play` requests are supported. Each
+   request constructs a fresh `GameState` from the JSON payload —
+   fresh transposition table, killer-move table, board, hash. Nothing
+   is shared between requests.
+7. CLI: rich `clap` interface with both short and long flags, bold-cyan
+   section headers in `--help`, bold-yellow examples and command names.
+8. Auto-detect CPU count via `available_parallelism()` and use it both
+   as the `actix-web` worker count and as the default search-concurrency
+   semaphore (`-j` overrides).
+9. CLI argument names match the C version. Flag-by-flag parity is
+   tested by the integration script.
 
-This binary should have a rich CLI interface, which offers both short and long version of the flags. Ideally
-help screen's section names are in bold cyan, regular text is normal font, and any command or example is bold
-yellow. 
+## Algorithm
 
-The binary should auto-detect number of CPU cores available and limit it's concurrency to that number.
+The minimax + threat-evaluation algorithm is a faithful port of
+`gomoku-c/src/gomoku/{ai,eval,game,board}.c` with the bugfixes and
+performance work applied (see commit history). Whenever the two
+diverge, the C version is the reference.
 
-`gomoku-rust-httpd` should ideally accept the same CLI arguments as it's C counter part, and it's JSON should be exactly the same to accept and to send back to.
+The Rust port adds **root-level parallelism** via rayon: when more
+than one CPU is available and the search is non-trivial, root moves
+are split across cores, each worker holding its own `GameState`
+clone. See `ai.rs::run_root_search`.
 
-## Play Algorithm & Evaluation Function
+## Build, test, run
 
-You have two options for creating the algorithm that decides the next move:
+```bash
+just build              # cargo build, copies binary into ./bin/
+just build-release      # release build, copies into ./bin/
+just test               # cargo test
+just ci                 # fmt-check + lint + test-all + doc + integration + audit
+just integration        # spins up the daemon and runs two clients against it
+just demo               # quick local game using the bundled HTTP client
+```
 
-1. copy the C code and use unit tests to ensire their correctness. That's the most sane option.
-2. read the PDFs in the folder /doc and deep-think your own strategy for playig this game (you know the rules) and start by creating the detailed plan on how to execute, and store it in doc/execution-plan.md. Make sure every feature has an automated test coverage.
-  * Start a sub-agent that will read the plan and become the Orchestrator: it will identify if any operations are parallelizeable  and if so it would launch a sub-agent for each task. Eventually needs to go through all of the tasks. 
+The release binary lives at both `target/release/gomoku-rust-httpd`
+and `bin/gomoku-rust-httpd` after `just build-release`.
 
-  * Copy executable `gomoku-http-client` from ../gomoku-multi-mode-monorepo/bin/ directory into our ./bin directory, and then you can create a shell-based integration test which starts the daemon, and then starts two thest clients pointed at the same daemon. They will start playing the game until one of them wins or a draw hapens.
+## Files of interest
 
-Make sure that in any case executable `gomoku-rust-httpd` is installed into the `/bin` folder when `just build` is ran, and `just ci` runs all the checks. Copy `lefthook.yml` from the gomoku monorepo and update it for linting and formatting with rust commands. Copy Brew file and specify only extenal Rust dependencies or tools absolutely necessary. 
+```
+src/
+  main.rs       HTTP server, CLI, semaphore, logger, request handler
+  ai.rs         Move generation, VCT, minimax, root-parallel iterative deepening
+  eval.rs       Threat-pattern matrix and position evaluation
+  game.rs       GameState, transposition table, Zobrist hashing, killer moves
+  board.rs      Flat-vec board, win detection, coordinate notation
+  json_api.rs   Wire-compatible JSON parsing / serialization
 
-Document the entire journey in doc/step-NN-name-of-the-step.md that each sub-agent should create only one of. Each should contain a section on what to do next, that each new subagent reads, given the documents.
+doc/            Algorithmic notes and step-by-step build journal
+.github/workflows/ci.yml   GitHub Actions: fmt, clippy, test (Linux+macOS), build
+lefthook.yml    Local pre-commit/pre-push gates (mirror of CI)
+Brewfile        Optional toolchain dependencies (just, lefthook, etc.)
+```
 
-Work on this in a loop until the binary builds, the tests coverage is over 90%, justfile has most of the important commands to build, run, test two clients against one binary, etc. 
+## When extending
 
-And in the very end write a comprehensive README.md intended first on the user of the binary (opeerations), and the second part on developing the algorithm further.
+- New heuristics: add the pattern recognizer in `eval.rs::evaluate_threat_fast`
+  (so it shows up in move ordering), then insert the step in
+  `ai::find_best_ai_move` between `block_vct` and the `run_root_search`
+  call. Push a `ScoringEntry`. Add a unit test in `src/ai.rs::tests`.
+- New CLI flag: extend `Cli` in `main.rs`; document in `--help` text and
+  in the README's CLI table.
+- New JSON field: parse in `json_api::parse_game`, emit in
+  `json_api::serialize_game_ex`. Round-trip tests in
+  `json_api::tests` should cover both directions.
 
-The actual algorithm that plays the game can copy C's algorithm or come up with something better based on reading the gomoku-c, or  Create a Rust project in the gomoku-rust folder and start porting the gomoku-httpd daemon to Rust please, using most modern Rust constructs and libraries.
+## Style
+
+- 4-space indentation (rustfmt default).
+- `cargo clippy --all-targets -- -D warnings` is clean. CI enforces it.
+- No `unsafe` outside `main.rs`'s pre-`env_logger`-init env var write
+  (which is documented as safe at startup).
+- Comments explain *why*, not *what*. Prefer self-explanatory names.
