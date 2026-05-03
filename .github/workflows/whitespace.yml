@@ -1,0 +1,23 @@
+name: Whitespace
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: whitespace-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  whitespace:
+    name: git diff --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for whitespace errors and conflict markers
+        run: git --no-pager diff --check HEAD~1..HEAD -- || git --no-pager diff --check
