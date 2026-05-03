@@ -4,11 +4,14 @@
 use crate::board::{Board, CELL_CROSSES, CELL_EMPTY, other_player};
 use crate::eval::{
     WIN_SCORE, evaluate_position, evaluate_position_incremental_fast, evaluate_threat_fast,
-    populate_threat_matrix,
 };
 use crate::game::{GameState, TT_EXACT, TT_LOWER_BOUND, TT_UPPER_BOUND};
 use rand::Rng;
+use rayon::prelude::*;
 use std::cmp::{max, min};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::available_parallelism;
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
@@ -53,6 +56,9 @@ impl ScoringReport {
 // Move generation
 // ============================================================================
 
+/// Maximum supported board (19x19) — used to size scratch arrays without alloc.
+const MAX_BOARD_CELLS: usize = 19 * 19;
+
 pub fn generate_moves(
     game: &GameState,
     board: &Board,
@@ -60,10 +66,20 @@ pub fn generate_moves(
     depth_remaining: i32,
 ) -> Vec<Move> {
     let size = board.size;
-    let mut moves = Vec::new();
 
-    let stones = board.stone_count();
-    if stones == 0 {
+    // Quick empty-board check: scan until first stone is found instead of
+    // counting all stones. `Board::stone_count` was iterating the full Vec
+    // on every call.
+    let mut any_stone = false;
+    'outer: for x in 0..size {
+        for y in 0..size {
+            if board.get(x, y) != CELL_EMPTY {
+                any_stone = true;
+                break 'outer;
+            }
+        }
+    }
+    if !any_stone {
         return vec![Move {
             x: (size / 2) as i32,
             y: (size / 2) as i32,
@@ -71,25 +87,30 @@ pub fn generate_moves(
         }];
     }
 
-    let mut candidate = vec![vec![false; size]; size];
+    // Stack-allocated candidate mask. Replaces a `vec![vec![false; size]; size]`
+    // that allocated `size + 1` heap vectors on every recursive call.
+    let mut candidate = [false; MAX_BOARD_CELLS];
     let radius = game.search_radius;
+    let isize_size = size as i32;
+    let mut moves = Vec::with_capacity(64);
 
     for x in 0..size {
         for y in 0..size {
             if board.get(x, y) == CELL_EMPTY {
                 continue;
             }
-            for dx in -radius..=radius {
-                for dy in -radius..=radius {
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    if nx < 0 || nx >= size as i32 || ny < 0 || ny >= size as i32 {
-                        continue;
-                    }
+            let xi = x as i32;
+            let yi = y as i32;
+            let x_lo = max(0, xi - radius);
+            let x_hi = min(isize_size - 1, xi + radius);
+            let y_lo = max(0, yi - radius);
+            let y_hi = min(isize_size - 1, yi + radius);
+            for nx in x_lo..=x_hi {
+                for ny in y_lo..=y_hi {
                     if board.get(nx as usize, ny as usize) != CELL_EMPTY {
                         continue;
                     }
-                    candidate[nx as usize][ny as usize] = true;
+                    candidate[nx as usize * size + ny as usize] = true;
                 }
             }
         }
@@ -97,7 +118,7 @@ pub fn generate_moves(
 
     for x in 0..size {
         for y in 0..size {
-            if !candidate[x][y] {
+            if !candidate[x * size + y] {
                 continue;
             }
             let priority = get_move_priority_optimized(
@@ -350,7 +371,6 @@ fn find_forced_win_block(
 
 pub fn minimax_with_timeout(
     game: &mut GameState,
-    board: &mut Board,
     depth: i32,
     mut alpha: i32,
     mut beta: i32,
@@ -362,9 +382,9 @@ pub fn minimax_with_timeout(
     if game.is_search_timed_out() {
         game.search_timed_out = true;
         if last_x >= 0 && last_y >= 0 {
-            return evaluate_position_incremental_fast(board, ai_player, last_x, last_y);
+            return evaluate_position_incremental_fast(&game.board, ai_player, last_x, last_y);
         }
-        return evaluate_position(board, ai_player);
+        return evaluate_position(&game.board, ai_player);
     }
 
     let hash = game.current_hash;
@@ -374,9 +394,13 @@ pub fn minimax_with_timeout(
     }
 
     // Terminal check
-    if last_x >= 0 && last_y >= 0 && board.get(last_x as usize, last_y as usize) != CELL_EMPTY {
-        let last_player = board.get(last_x as usize, last_y as usize);
-        if board.is_five_from_last_move(last_x, last_y, last_player) {
+    if last_x >= 0 && last_y >= 0 && game.board.get(last_x as usize, last_y as usize) != CELL_EMPTY
+    {
+        let last_player = game.board.get(last_x as usize, last_y as usize);
+        if game
+            .board
+            .is_five_from_last_move(last_x, last_y, last_player)
+        {
             let value = if last_player == ai_player {
                 WIN_SCORE + depth
             } else {
@@ -389,9 +413,9 @@ pub fn minimax_with_timeout(
 
     if depth == 0 {
         let value = if last_x >= 0 && last_y >= 0 {
-            evaluate_position_incremental_fast(board, ai_player, last_x, last_y)
+            evaluate_position_incremental_fast(&game.board, ai_player, last_x, last_y)
         } else {
-            evaluate_position(board, ai_player)
+            evaluate_position(&game.board, ai_player)
         };
         game.store_transposition(hash, ai_player, value, depth, TT_EXACT, -1, -1);
         return value;
@@ -402,7 +426,7 @@ pub fn minimax_with_timeout(
     } else {
         other_player(ai_player)
     };
-    let mut moves = generate_moves(game, board, current_player_turn, depth);
+    let mut moves = generate_moves(game, &game.board, current_player_turn, depth);
 
     if moves.is_empty() {
         return 0;
@@ -414,6 +438,11 @@ pub fn minimax_with_timeout(
     let mut best_y = -1i32;
     let original_alpha = alpha;
     let original_beta = beta;
+    let pi = if current_player_turn == CELL_CROSSES {
+        0
+    } else {
+        1
+    };
 
     if maximizing_player {
         let mut max_eval = -WIN_SCORE - 1;
@@ -424,21 +453,14 @@ pub fn minimax_with_timeout(
             }
 
             let (i, j) = (m.x, m.y);
-            board.set(i as usize, j as usize, current_player_turn);
-
-            let pi = if current_player_turn == CELL_CROSSES {
-                0
-            } else {
-                1
-            };
+            game.board.set(i as usize, j as usize, current_player_turn);
             let pos = i as usize * game.board_size + j as usize;
             game.current_hash ^= game.zobrist_keys[pi][pos];
 
-            let eval =
-                minimax_with_timeout(game, board, depth - 1, alpha, beta, false, ai_player, i, j);
+            let eval = minimax_with_timeout(game, depth - 1, alpha, beta, false, ai_player, i, j);
 
             game.current_hash ^= game.zobrist_keys[pi][pos];
-            board.set(i as usize, j as usize, CELL_EMPTY);
+            game.board.set(i as usize, j as usize, CELL_EMPTY);
 
             if eval > max_eval {
                 max_eval = eval;
@@ -475,21 +497,14 @@ pub fn minimax_with_timeout(
             }
 
             let (i, j) = (m.x, m.y);
-            board.set(i as usize, j as usize, current_player_turn);
-
-            let pi = if current_player_turn == CELL_CROSSES {
-                0
-            } else {
-                1
-            };
+            game.board.set(i as usize, j as usize, current_player_turn);
             let pos = i as usize * game.board_size + j as usize;
             game.current_hash ^= game.zobrist_keys[pi][pos];
 
-            let eval =
-                minimax_with_timeout(game, board, depth - 1, alpha, beta, true, ai_player, i, j);
+            let eval = minimax_with_timeout(game, depth - 1, alpha, beta, true, ai_player, i, j);
 
             game.current_hash ^= game.zobrist_keys[pi][pos];
-            board.set(i as usize, j as usize, CELL_EMPTY);
+            game.board.set(i as usize, j as usize, CELL_EMPTY);
 
             if eval < min_eval {
                 min_eval = eval;
@@ -518,6 +533,199 @@ pub fn minimax_with_timeout(
         }
         min_eval
     }
+}
+
+// ============================================================================
+// Root iterative-deepening search (with optional rayon parallelism)
+// ============================================================================
+
+/// Search a single root move on a (cloned) GameState. Returns the score.
+/// Mutates the passed-in GameState's TT and killer-move tables — caller must
+/// clone first if it doesn't want those side effects.
+fn search_one_root(game: &mut GameState, mv: Move, ai_player: i32, depth: i32) -> i32 {
+    let pi = if ai_player == CELL_CROSSES { 0 } else { 1 };
+    let (i, j) = (mv.x, mv.y);
+    game.board.set(i as usize, j as usize, ai_player);
+    let pos = i as usize * game.board_size + j as usize;
+    game.current_hash ^= game.zobrist_keys[pi][pos];
+
+    let score = minimax_with_timeout(
+        game,
+        depth - 1,
+        -WIN_SCORE - 1,
+        WIN_SCORE + 1,
+        false,
+        ai_player,
+        i,
+        j,
+    );
+
+    game.current_hash ^= game.zobrist_keys[pi][pos];
+    game.board.set(i as usize, j as usize, CELL_EMPTY);
+    score
+}
+
+/// Returns (best_x, best_y, moves_considered, final_best_score, won_early).
+/// `won_early` is true if a winning score was found and we should short-circuit.
+fn run_root_search(
+    game: &mut GameState,
+    sorted_moves: &[Move],
+    ai_player: i32,
+) -> (i32, i32, i32, i32, bool) {
+    let cores = available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // Parallelism is only worthwhile when the per-move search is expensive
+    // (depth >= 3) and we have at least a couple of root moves to spread.
+    // For shallow depths the clone overhead dominates.
+    let want_parallel = cores >= 2 && sorted_moves.len() >= 2 && game.max_depth >= 3;
+
+    let mut best_x = sorted_moves[0].x;
+    let mut best_y = sorted_moves[0].y;
+    let mut moves_considered = 0i32;
+    let mut final_best_score: i32 = -WIN_SCORE - 1;
+
+    for current_depth in 1..=game.max_depth {
+        if game.is_search_timed_out() {
+            break;
+        }
+
+        let (results, considered) = if want_parallel && current_depth >= 2 {
+            search_root_moves_parallel(game, sorted_moves, ai_player, current_depth, cores)
+        } else {
+            search_root_moves_serial(game, sorted_moves, ai_player, current_depth)
+        };
+
+        moves_considered += considered;
+
+        if !results.is_empty() {
+            let mut depth_best = i32::MIN;
+            for &(_, _, s) in &results {
+                if s > depth_best {
+                    depth_best = s;
+                }
+            }
+            let bests: Vec<&(i32, i32, i32)> = results
+                .iter()
+                .filter(|(_, _, s)| *s == depth_best)
+                .collect();
+            if !bests.is_empty() {
+                let idx = rand::rng().random_range(0..bests.len());
+                best_x = bests[idx].0;
+                best_y = bests[idx].1;
+                final_best_score = depth_best;
+            }
+
+            // Early exit if we found a near-immediate win.
+            if depth_best >= WIN_SCORE - 1000 {
+                return (best_x, best_y, moves_considered, depth_best, true);
+            }
+        }
+
+        if game.search_timed_out {
+            break;
+        }
+    }
+
+    (best_x, best_y, moves_considered, final_best_score, false)
+}
+
+fn search_root_moves_serial(
+    game: &mut GameState,
+    sorted_moves: &[Move],
+    ai_player: i32,
+    depth: i32,
+) -> (Vec<(i32, i32, i32)>, i32) {
+    let mut results = Vec::with_capacity(sorted_moves.len());
+    let mut considered = 0i32;
+    for m in sorted_moves {
+        if game.is_search_timed_out() {
+            game.search_timed_out = true;
+            break;
+        }
+        let score = search_one_root(game, *m, ai_player, depth);
+        results.push((m.x, m.y, score));
+        considered += 1;
+        if game.search_timed_out {
+            break;
+        }
+        if score >= WIN_SCORE - 1000 {
+            break;
+        }
+    }
+    (results, considered)
+}
+
+/// Parallel root-move search. Each worker takes a chunk of the sorted root
+/// moves and searches them on its own GameState clone. The clones each carry
+/// their own TT and killer-move tables — no shared mutable state, no locks
+/// — and are dropped when the search completes, so nothing leaks across
+/// requests. A shared `AtomicBool` lets workers cooperate on timeout.
+fn search_root_moves_parallel(
+    game: &mut GameState,
+    sorted_moves: &[Move],
+    ai_player: i32,
+    depth: i32,
+    cores: usize,
+) -> (Vec<(i32, i32, i32)>, i32) {
+    let n = sorted_moves.len();
+    let workers = cores.min(n).max(1);
+    let chunk_size = n.div_ceil(workers);
+    let timeout_flag = Arc::new(AtomicBool::new(false));
+
+    let chunks: Vec<&[Move]> = sorted_moves.chunks(chunk_size).collect();
+    let parent_search_start = game.search_start;
+    let parent_move_timeout = game.move_timeout;
+
+    let outputs: Vec<(Vec<(i32, i32, i32)>, i32, bool)> = chunks
+        .into_par_iter()
+        .map(|chunk| {
+            // Each worker gets its own GameState clone so the TT, killer moves,
+            // hash, and board mutations don't collide with other workers or
+            // with the parent search.
+            let mut local = game.clone();
+            local.search_start = parent_search_start;
+            local.move_timeout = parent_move_timeout;
+            local.search_timed_out = false;
+
+            let mut local_results = Vec::with_capacity(chunk.len());
+            let mut local_considered = 0i32;
+            let mut local_timed_out = false;
+
+            for m in chunk {
+                if timeout_flag.load(Ordering::Relaxed) || local.is_search_timed_out() {
+                    local.search_timed_out = true;
+                    local_timed_out = true;
+                    break;
+                }
+                let score = search_one_root(&mut local, *m, ai_player, depth);
+                local_results.push((m.x, m.y, score));
+                local_considered += 1;
+                if local.search_timed_out {
+                    local_timed_out = true;
+                    timeout_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if score >= WIN_SCORE - 1000 {
+                    // Other workers can stop early too.
+                    timeout_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            (local_results, local_considered, local_timed_out)
+        })
+        .collect();
+
+    let mut all_results = Vec::with_capacity(n);
+    let mut total_considered = 0i32;
+    let mut any_timeout = false;
+    for (rs, c, t) in outputs {
+        all_results.extend(rs);
+        total_considered += c;
+        any_timeout |= t;
+    }
+    if any_timeout {
+        game.search_timed_out = true;
+    }
+    (all_results, total_considered)
 }
 
 // ============================================================================
@@ -583,8 +791,6 @@ fn find_first_ai_move(game: &GameState) -> (i32, i32) {
 }
 
 pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, String) {
-    populate_threat_matrix();
-
     game.search_start = Some(Instant::now());
     game.search_timed_out = false;
     game.current_hash = game.compute_zobrist_hash();
@@ -593,7 +799,7 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
     let ai_player = game.current_player;
     let opponent = other_player(ai_player);
 
-    let stone_count = game.board.stone_count();
+    let stone_count = game.stones_on_board as usize;
 
     if stone_count == 1 {
         let (bx, by) = find_first_ai_move(game);
@@ -604,18 +810,34 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
     let moves = generate_moves(game, &game.board, ai_player, game.max_depth);
     let move_count = moves.len() as i32;
 
-    // Step 1: Check for immediate winning moves
+    // Pre-compute the threat values for every candidate move ONCE; the prologue
+    // steps below previously called `evaluate_threat_fast` 5–7 times for each
+    // (move, player) pair, all on the unchanged root board.
+    let n = moves.len();
+    let mut my_threats = Vec::with_capacity(n);
+    let mut opp_threats = Vec::with_capacity(n);
+    for m in &moves {
+        my_threats.push(evaluate_threat_fast(&game.board, m.x, m.y, ai_player));
+        opp_threats.push(evaluate_threat_fast(&game.board, m.x, m.y, opponent));
+    }
+
+    // Step 1: collect immediate fives (>= 1_000_000) and open fours (500_000)
+    // separately. Open four wins in TWO turns, so the opponent moves first;
+    // we must check opponent immediate threats before committing to one.
     let step_start = Instant::now();
-    let mut winning_moves = Vec::new();
+    let mut winning_moves: Vec<(i32, i32)> = Vec::new();
+    let mut open_four_moves: Vec<(i32, i32)> = Vec::new();
     let mut our_max_score = 0i32;
 
-    for m in &moves {
-        let threat = evaluate_threat_fast(&game.board, m.x, m.y, ai_player);
+    for (idx, m) in moves.iter().enumerate() {
+        let threat = my_threats[idx];
         if threat > our_max_score {
             our_max_score = threat;
         }
-        if threat >= 500_000 {
+        if threat >= 1_000_000 {
             winning_moves.push((m.x, m.y));
+        } else if threat >= 500_000 {
+            open_four_moves.push((m.x, m.y));
         }
     }
 
@@ -637,17 +859,19 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
         return (winning_moves[idx], report, "have_win".to_string());
     }
 
-    // Step 2: Block opponent >= 40000
+    // Step 2: Block opponent immediate wins (>= 500_000 — five or open four).
+    // Closed fours (100_000) are intentionally NOT blocked here; they're handled
+    // by minimax which can weigh defense against an offensive reply.
     let step_start = Instant::now();
-    let mut blocking_moves = Vec::new();
+    let mut blocking_moves: Vec<(i32, i32, i32)> = Vec::new();
     let mut max_opp_threat = 0i32;
 
-    for m in &moves {
-        let opp_threat = evaluate_threat_fast(&game.board, m.x, m.y, opponent);
+    for (idx, m) in moves.iter().enumerate() {
+        let opp_threat = opp_threats[idx];
         if opp_threat > max_opp_threat {
             max_opp_threat = opp_threat;
         }
-        if opp_threat >= 40000 {
+        if opp_threat >= 500_000 {
             blocking_moves.push((m.x, m.y, opp_threat));
         }
     }
@@ -657,24 +881,49 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
         e.evaluated_moves = move_count;
         e.score = -max_opp_threat;
         e.time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-        if !blocking_moves.is_empty() && max_opp_threat >= 40000 {
+        if !blocking_moves.is_empty() {
             e.decisive = true;
         }
         report.defensive_max_score = -max_opp_threat;
     }
 
-    if !blocking_moves.is_empty() && max_opp_threat >= 40000 {
-        let best: Vec<_> = blocking_moves
+    if !blocking_moves.is_empty() {
+        // Among equally urgent blocks, prefer the one that also builds offense.
+        let best: Vec<&(i32, i32, i32)> = blocking_moves
             .iter()
             .filter(|b| b.2 == max_opp_threat)
             .collect();
-        let idx = rand::rng().random_range(0..best.len());
+        let mut best_idx = 0usize;
+        let mut best_own = -1i32;
+        for (i, b) in best.iter().enumerate() {
+            // Look up the cached threat for (b.0, b.1) by index in `moves`.
+            let own = moves
+                .iter()
+                .position(|mv| mv.x == b.0 && mv.y == b.1)
+                .map(|p| my_threats[p])
+                .unwrap_or(0);
+            if own > best_own {
+                best_own = own;
+                best_idx = i;
+            }
+        }
+        let chosen = best[best_idx];
         game.last_ai_moves_evaluated = blocking_moves.len() as i32;
-        return (
-            (best[idx].0, best[idx].1),
-            report,
-            "block_threat".to_string(),
-        );
+        return ((chosen.0, chosen.1), report, "block_threat".to_string());
+    }
+
+    // Step 2.5: Play our open four (500_000) — safe now that opponent's
+    // immediate threats are checked. Wins in two turns barring a counter-five.
+    if !open_four_moves.is_empty() {
+        let e = report.add_entry("open_four", true);
+        e.evaluated_moves = open_four_moves.len() as i32;
+        e.score = 500_000;
+        e.time_ms = 0.0;
+        e.decisive = true;
+        report.offensive_max_score = report.offensive_max_score.max(500_000);
+        let idx = rand::rng().random_range(0..open_four_moves.len());
+        game.last_ai_moves_evaluated = open_four_moves.len() as i32;
+        return (open_four_moves[idx], report, "open_four".to_string());
     }
 
     // Step 3: Offensive VCT
@@ -720,238 +969,25 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
         return ((dx, dy), report, "block_vct".to_string());
     }
 
-    // Step 4b: Compound three threat
-    let step_start = Instant::now();
-    let mut compound_threes: Vec<(i32, i32, i32)> = Vec::new();
-    for m in &moves {
-        let threat = evaluate_threat_fast(&game.board, m.x, m.y, ai_player);
-        if (30000..40000).contains(&threat) {
-            compound_threes.push((m.x, m.y, threat));
-        }
-    }
-
-    {
-        let max_ct = compound_threes.iter().map(|c| c.2).max().unwrap_or(0);
-        let e = report.add_entry("compound_three", true);
-        e.evaluated_moves = compound_threes.len() as i32;
-        e.score = max_ct;
-        e.time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-        if !compound_threes.is_empty() {
-            e.decisive = true;
-        }
-    }
-
-    if !compound_threes.is_empty() {
-        compound_threes.sort_by(|a, b| b.2.cmp(&a.2));
-        game.last_ai_moves_evaluated = compound_threes.len() as i32;
-        return (
-            (compound_threes[0].0, compound_threes[0].1),
-            report,
-            "compound_three".to_string(),
-        );
-    }
-
-    // Step 5: Block opponent open three
-    let step_start = Instant::now();
-    let mut open_three_blocks: Vec<(i32, i32, i32)> = Vec::new();
-    let mut max_open_three = 0i32;
-
-    for m in &moves {
-        let opp_threat = evaluate_threat_fast(&game.board, m.x, m.y, opponent);
-        let needs_blocking = opp_threat == 1500 || (30000..40000).contains(&opp_threat);
-        if needs_blocking {
-            if opp_threat > max_open_three {
-                max_open_three = opp_threat;
-            }
-            open_three_blocks.push((m.x, m.y, opp_threat));
-        }
-    }
-
-    let mut blocked_open_three = false;
-    let mut block_result = (-1i32, -1i32);
-
-    if !open_three_blocks.is_empty() {
-        let mut our_max_threat_val = 0i32;
-        let mut our_four_count = 0;
-        let mut our_open_three_count = 0;
-
-        for m in &moves {
-            let my_threat = evaluate_threat_fast(&game.board, m.x, m.y, ai_player);
-            if my_threat > our_max_threat_val {
-                our_max_threat_val = my_threat;
-            }
-            if my_threat >= 10000 {
-                our_four_count += 1;
-            } else if my_threat >= 1500 {
-                our_open_three_count += 1;
-            }
-        }
-
-        let we_have_initiative = our_max_threat_val >= 40000
-            || our_four_count >= 2
-            || (our_four_count >= 1 && our_open_three_count >= 1)
-            || (our_max_threat_val >= 1500 && our_max_threat_val > max_open_three);
-
-        if !we_have_initiative {
-            let best_blocks: Vec<_> = open_three_blocks
-                .iter()
-                .filter(|b| b.2 == max_open_three)
-                .collect();
-            let mut best_idx = 0;
-            let mut best_own = 0;
-            for (i, b) in best_blocks.iter().enumerate() {
-                let own = evaluate_threat_fast(&game.board, b.0, b.1, ai_player);
-                if own > best_own {
-                    best_own = own;
-                    best_idx = i;
-                }
-            }
-            block_result = (best_blocks[best_idx].0, best_blocks[best_idx].1);
-            blocked_open_three = true;
-        }
-    }
-
-    {
-        let e = report.add_entry("block_open_three", false);
-        e.evaluated_moves = open_three_blocks.len() as i32;
-        e.score = -max_open_three;
-        e.time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-        if blocked_open_three {
-            e.decisive = true;
-        }
-    }
-
-    if blocked_open_three {
-        game.last_ai_moves_evaluated = open_three_blocks.len() as i32;
-        return (block_result, report, "block_open_three".to_string());
-    }
-
-    // Step 6: Forcing four
-    let step_start = Instant::now();
-    let mut forcing_moves: Vec<(i32, i32, i32)> = Vec::new();
-    let mut max_forcing = 0i32;
-
-    for m in &moves {
-        let threat = evaluate_threat_fast(&game.board, m.x, m.y, ai_player);
-        if threat >= 10000 {
-            if threat > max_forcing {
-                max_forcing = threat;
-            }
-            forcing_moves.push((m.x, m.y, threat));
-        }
-    }
-
-    let mut played_forcing = false;
-    let mut forcing_result = (-1i32, -1i32);
-
-    if !forcing_moves.is_empty() {
-        for m in &moves {
-            let threat = evaluate_threat_fast(&game.board, m.x, m.y, ai_player);
-            if threat == max_forcing {
-                forcing_result = (m.x, m.y);
-                played_forcing = true;
-                break;
-            }
-        }
-    }
-
-    {
-        let e = report.add_entry("forcing_four", true);
-        e.evaluated_moves = forcing_moves.len() as i32;
-        e.score = max_forcing;
-        e.time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-        if played_forcing {
-            e.decisive = true;
-        }
-    }
-
-    if played_forcing {
-        game.last_ai_moves_evaluated = forcing_moves.len() as i32;
-        return (forcing_result, report, "forcing_four".to_string());
-    }
-
-    // Step 7: Minimax iterative deepening
+    // Step 5: Minimax iterative deepening (root-level parallel when there's
+    // more than one CPU available — each worker takes a slice of the sorted
+    // root moves and searches it on its own GameState clone).
     let step_start = Instant::now();
     let mut sorted_moves = moves.clone();
     sorted_moves.sort_by(|a, b| b.priority.cmp(&a.priority));
 
-    let mut best_x = sorted_moves[0].x;
-    let mut best_y = sorted_moves[0].y;
-    let mut moves_considered = 0i32;
-    let mut final_best_score: i32 = -WIN_SCORE - 1;
+    let (best_x_out, best_y_out, moves_considered, final_best_score, won_early) =
+        run_root_search(game, &sorted_moves, ai_player);
 
-    for current_depth in 1..=game.max_depth {
-        if game.is_search_timed_out() {
-            break;
-        }
-
-        let mut depth_best_score = -WIN_SCORE - 1;
-        let mut best_at_depth: Vec<(i32, i32)> = Vec::new();
-
-        for m in &sorted_moves {
-            if game.is_search_timed_out() {
-                game.search_timed_out = true;
-                break;
-            }
-
-            let (i, j) = (m.x, m.y);
-            game.board.set(i as usize, j as usize, ai_player);
-
-            let pi = if ai_player == CELL_CROSSES { 0 } else { 1 };
-            let pos = i as usize * game.board_size + j as usize;
-            game.current_hash ^= game.zobrist_keys[pi][pos];
-
-            let score = minimax_with_timeout(
-                game,
-                &mut game.board.clone(),
-                current_depth - 1,
-                -WIN_SCORE - 1,
-                WIN_SCORE + 1,
-                false,
-                ai_player,
-                i,
-                j,
-            );
-
-            game.current_hash ^= game.zobrist_keys[pi][pos];
-            game.board.set(i as usize, j as usize, CELL_EMPTY);
-
-            if score > depth_best_score {
-                depth_best_score = score;
-                best_at_depth.clear();
-                best_at_depth.push((i, j));
-
-                if score >= WIN_SCORE - 1000 {
-                    best_x = i;
-                    best_y = j;
-                    game.last_ai_moves_evaluated = moves_considered + 1;
-
-                    let e = report.add_entry("minimax", true);
-                    e.evaluated_moves = moves_considered + 1;
-                    e.score = score;
-                    e.have_win = true;
-                    e.time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-                    report.offensive_max_score = report.offensive_max_score.max(score);
-
-                    return ((best_x, best_y), report, "minimax".to_string());
-                }
-            } else if score == depth_best_score {
-                best_at_depth.push((i, j));
-            }
-
-            moves_considered += 1;
-
-            if game.search_timed_out {
-                break;
-            }
-        }
-
-        if !game.search_timed_out && !best_at_depth.is_empty() {
-            let idx = rand::rng().random_range(0..best_at_depth.len());
-            best_x = best_at_depth[idx].0;
-            best_y = best_at_depth[idx].1;
-            final_best_score = depth_best_score;
-        }
+    if won_early {
+        game.last_ai_moves_evaluated = moves_considered;
+        let e = report.add_entry("minimax", true);
+        e.evaluated_moves = moves_considered;
+        e.score = final_best_score;
+        e.have_win = true;
+        e.time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+        report.offensive_max_score = report.offensive_max_score.max(final_best_score);
+        return ((best_x_out, best_y_out), report, "minimax".to_string());
     }
 
     {
@@ -963,7 +999,7 @@ pub fn find_best_ai_move(game: &mut GameState) -> ((i32, i32), ScoringReport, St
     }
 
     game.last_ai_moves_evaluated = moves_considered;
-    ((best_x, best_y), report, "minimax".to_string())
+    ((best_x_out, best_y_out), report, "minimax".to_string())
 }
 
 #[cfg(test)]

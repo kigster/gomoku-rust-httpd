@@ -37,8 +37,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use crate::eval::populate_threat_matrix;
-
 const DAEMON_VERSION: &str = "1.0.1";
 
 // ============================================================================
@@ -414,8 +412,9 @@ async fn handle_play(
         .collect::<Vec<_>>()
         .join(" -> ");
 
+    let request_latency_secs = request_start.elapsed().as_secs_f64();
     info!(
-        "play: player={} move=[{},{}] type={} depth={} radius={} evals={} time={:.3}s queue={:.2}ms pipeline={}",
+        "play: player={} move=[{},{}] type={} depth={} radius={} evals={} time={:.3}s queue={:.2}ms pipeline={} request latency [{:.3} seconds]",
         if ai_player == board::CELL_CROSSES {
             "X"
         } else {
@@ -430,6 +429,7 @@ async fn handle_play(
         elapsed_time,
         queue_wait_ms,
         pipeline,
+        request_latency_secs,
     );
 
     if let Some(w) = winner_label {
@@ -553,8 +553,6 @@ async fn main() -> std::io::Result<()> {
         eprintln!("Expected format: host:port or just port");
         std::process::exit(1);
     });
-
-    populate_threat_matrix();
 
     let detected_cores = available_parallelism().map(|n| n.get()).unwrap_or(2);
     let workers = cli.max_concurrency.unwrap_or(detected_cores).max(1);

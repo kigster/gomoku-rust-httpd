@@ -130,6 +130,7 @@ impl Board {
     }
 
     /// Count stones on the board.
+    #[allow(dead_code)]
     pub fn stone_count(&self) -> usize {
         self.cells.iter().filter(|&&c| c != CELL_EMPTY).count()
     }

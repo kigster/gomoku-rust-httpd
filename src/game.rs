@@ -64,6 +64,7 @@ pub enum PlayerType {
 }
 
 /// Full game state.
+#[derive(Clone)]
 pub struct GameState {
     pub board: Board,
     pub board_size: usize,
