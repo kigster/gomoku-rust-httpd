@@ -26,7 +26,10 @@ C reference this build adds:
 - Request-latency reporting: every `play:` INFO log line ends with
   `request latency [N.NNN seconds]` at 3-decimal precision.
 
+> [!IMPORTANT]
+>
 > **Two halves below.** Part I is for **operators** running the daemon.
+> 
 > Part II is for **developers** extending the AI.
 
 ---
